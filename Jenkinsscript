@@ -1,0 +1,76 @@
+#!/usr/bin/groovy
+import groovy.json.JsonOutput
+
+properties([[$class: 'ParametersDefinitionProperty', parameterDefinitions: [ 
+    [$class: 'hudson.model.StringParameterDefinition', name: 'NAMESPACE', defaultValue: 'jarvis-streams', description: 'Namespace where you want to perform the sanity check'],
+    [$class: 'hudson.model.StringParameterDefinition', name: 'ENVIRONMENT', defaultValue: 'DEV', description: 'Provide the environment to run the validation'],
+    [$class: 'hudson.model.StringParameterDefinition', name: 'PERFORM', defaultValue: 'seldon', description: 'Type of validation to perform (seldon/jarvis)']
+]]])
+
+String value_namespace = params.NAMESPACE
+String value_environment = params.ENVIRONMENT
+String value_perform = params.PERFORM
+String value_clone_url = "https://gitlab.verizon.com/jarvis/jarvis_models/vcg-realtime-ssd/rt-ivr90-tbr-v2.git"
+String value_email_recipients = "udit.sharma@verizon.com"
+
+pipeline {
+    agent { node "eks-jarvisuat-ienv-npge.aws-us-east-1-green.kube-np.ebiz.verizon.com" }
+
+    stages {
+        stage('Fetching artifacts') {
+            steps {
+                script {
+                    echo "Checking out from git"
+                    checkout changelog: false, poll: false, scm: [
+                        $class: 'GitSCM',
+                        branches: [[name: '*/development']],
+                        extensions: [[$class: 'CloneOption', depth: 1, noTags: true, reference: '', shallow: true]],
+                        gitTool: 'Default',
+                        userRemoteConfigs: [[credentialsId: 'jarvis-svc-creds', url: value_clone_url]]
+                    ]
+                    echo "Success!"
+                }
+            }
+        }
+        stage('Prepare environment') {
+            steps {
+                script {
+                    // Create a directory for the validation results
+                    sh 'mkdir -p Validation'
+                }
+            }
+        }
+        stage('Run validation') {
+            steps {
+                sh '''
+                export http_proxy=proxy.ebiz.verizon.com:80
+                export https_proxy=proxy.ebiz.verizon.com:80
+                export no_proxy=localhost,127.0.0.1,verizon.com,*.verizon.com
+                PATH=$WORKSPACE/venv/bin:/usr/local/bin:$PATH
+
+                python3 -m pip install requests pandas
+
+                # Run the validation script with the specified namespace, environment, and perform parameters
+                NAMESPACE=${NAMESPACE} PERFORM=${PERFORM} python3 validation.py
+                '''
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                // Sleep for a specified time before cleaning workspace
+                sleep(time: 59, unit: 'SECONDS')
+                
+                // Send email with the CSV file attached
+                emailext attachmentsPattern: '**/Validation/*.csv',
+                          to: value_email_recipients,
+                          subject: "Sanity Check Results",
+                          body: "Please find the attached sanity check results."
+                
+                // Clean workspace
+                cleanWs()
+            }
+        }
+    }
+}
