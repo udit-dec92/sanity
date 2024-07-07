@@ -1,0 +1,12 @@
+{
+    "inputs": [
+        {
+            "name": "input_request",
+            "shape": [
+                1
+            ],
+            "datatype": "BYTES",
+            "data": {}
+        }
+    ]
+}
