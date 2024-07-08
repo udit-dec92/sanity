@@ -1,0 +1,212 @@
+import json
+import requests
+import pandas as pd
+import warnings
+import string
+import random
+import time
+warnings.filterwarnings("ignore")
+from pathlib import Path
+here = str(Path(__file__).parent.absolute())
+
+with open(here+"//experiments_validation.json",'r') as fp:
+    main_data=json.load(fp)
+
+payload_seldon = main_data[0][0]
+url_headers = main_data[1]
+data = main_data[2]
+
+def requesting(url,load,headers):
+    """
+        This requesting() makes the api call
+    """
+    try: 
+        response= requests.post(url,json=load,headers=headers,verify=False)
+        response.raise_for_status() 
+        output=response.json()
+        return output
+
+    except requests.exceptions.HTTPError as errh: 
+        output={'outputs':[{'data':[{'KeyError':errh.args[0]}]}]}
+        #print("HTTP Error")
+        return output
+    
+def validate(idx,response,category):
+    print(idx+1,"Validating...")
+    channelName = response["serviceHeader"]["channelName"]
+    jarvisTransactionID = response["serviceHeader"]["jarvisTransactionId"]
+    time_taken = str(response["serviceHeader"]["timeTaken"])+" ms"
+    ecId = response["serviceHeader"]["ecId"]
+    idx=idx
+
+    valid = response["serviceResponse"]["rtModel"]["rtModelRes"][0]["result"]
+
+    try:
+        if (valid["prediction"] != {}):
+        
+            # MODEL NAME
+            if ("ctrl" in response['serviceResponse']["rtModel"]["rtModelRes"][0]["modelName"]):
+                model_name = "CONTROL"
+            elif ("rt-pzaas-v" in response['serviceResponse']["rtModel"]["rtModelRes"][0]["modelName"]):
+                model_name = "TREAT"
+            else:
+                model_name = response['serviceResponse']["rtModel"]["rtModelRes"][0]["modelName"]
+
+            # THROTTLE LABEL
+            exp_throttle_label = response["serviceResponse"]["rtModel"]["rtModelRes"][0]["result"]["prediction"]["expMetadata"]["expThrottleLabel"]
+            if(exp_throttle_label == ""):
+                exp_throttle_label = "EMPTY THROTTLE"
+                model_state = "ERROR"
+            else:
+                exp_throttle_label = response["serviceResponse"]["rtModel"]["rtModelRes"][0]["result"]["prediction"]["expMetadata"]["expThrottleLabel"]
+                model_state = "OK"
+        else:
+            model_name = "EMPTY PREDICTION"
+            model_state = "ERROR"
+            exp_throttle_label = "NA"
+
+        return([data[idx]["criteria_id"], channelName, category, exp_throttle_label, jarvisTransactionID, model_name, model_state])
+    
+    except: 
+        model_name="MODEL DOWN"
+        exp_throttle_label = "NA"
+        model_state = "ERROR"
+        return([data[idx]["criteria_id"], channelName, category, exp_throttle_label, jarvisTransactionID, model_name, model_state])
+
+def validate_seldon(idx,response,model):
+    print(idx+1,"Validating...")
+    exp_throttle_label="NA"
+    valid = response["outputs"][0]["data"][0]
+    result = valid
+
+    try:
+        if(type(valid)==dict):
+            model_name = valid['KeyError']
+            exp_throttle_label = "NA"
+            model_state = "ERROR"
+        else:
+            valid=json.loads(valid)
+            result = valid["jsonData"]["prediction"]
+            if (valid["jsonData"]["prediction"] != {}):
+    
+                # THROTTLE LABEL
+                exp_throttle_label = valid["jsonData"]["prediction"]["expMetadata"]["expThrottleLabel"]
+                if(exp_throttle_label == ""):
+                    exp_throttle_label = "EMPTY THROTTLE"
+                    model_state = "ERROR"
+                else:
+                    exp_throttle_label = valid["jsonData"]["prediction"]["expMetadata"]["expThrottleLabel"]
+                    model_state = "OK"
+                # MODEL NAME
+                if(valid["jsonData"]["prediction"]["expMetadata"]["modelId"]=='rt-pzaas-ctrl-v1'):
+                    model_name="CONTROL"
+                elif(valid["jsonData"]["prediction"]["expMetadata"]["modelId"]=='rt-pzaas-v1'):
+                    model_name="TREAT"
+                else:
+                    model_name=""
+
+        return([model, exp_throttle_label, model_name, model_state, result])
+
+
+    except:
+        model_name = "NA"
+        exp_throttle_label = "NA"
+        model_state = "ERROR"
+        #print(data[idx]["model"], " : ", channelName," : ",exp_throttle_label, " : ", model_state, " : ", jarvisTransactionID)
+        return([model, exp_throttle_label, model_name, model_state, result])
+
+def jarvis_validation(count,url):
+    print("Inside Jarvis Validation:\ncount:",count,"\nurl:",url)
+    # JARVIS VALIDATION
+    table=[]
+    for idx,_input in enumerate(data):
+        payload=_input["data"]
+        category = payload['serviceRequest']['rtModel']['rtModelReq'][0]['features']['ClientFeature']['contextInfo']['category']
+        #if category=="Gridwall":
+        for _count in range(count):
+            payload['serviceHeader']['ecId'] = ''.join(random.choices(string.ascii_uppercase + string.digits, k = 10)) 
+            response = requesting(url=url,load=payload,headers={'content-type': 'application/json'})
+            validation = validate(idx,response,category)
+            table.append(validation)
+
+    print("JARVIS VALIDATION COMPLETE")
+    timestr = time.strftime("%m-%d-%Y-%H%M%S")
+    table = pd.DataFrame(table)
+    table.columns=["usecase","channelName","category","Throttle_Label","jarvisTransactionID","Model_name","Model_state"]        
+    table['Endpoint']=url
+    table = table.loc[:,["usecase","Model_state","channelName","category","Throttle_Label","Model_name","jarvisTransactionID","Endpoint"]]
+    table.to_csv(here+"//Validations//Validation-"+timestr+".csv")
+
+    empty_throttle=table[table['Model_state']=="ERROR"]
+    if(len(empty_throttle)!=0):
+        print("ERROR IN JARVIS VALIDATION...")
+        empty_throttle.to_csv(here+"//Validations//Empty_throttle-"+timestr+".csv")
+        seldon_validation(3,url)
+
+def seldon_validation(count,url_seldon):
+    #SELDON VALIDATION
+    print("Inside Seldon Validation :\ncount=",count)
+    list_seldon=[]
+    timestr = time.strftime("%m-%d-%Y-%H%M%S")
+    payload=payload_seldon
+
+    for idx,_input in enumerate(url_headers):    
+        for _count in range(count):
+            url=_input[url_seldon[14:21]]
+            headers=_input['header']
+            model=_input['model']
+            response = requesting(url,payload,headers)
+            validation = validate_seldon(idx,response,model)
+            validation.append(url)
+            list_seldon.append(validation)
+
+    timestr = time.strftime("%m-%d-%Y-%H%M%S")
+    print("SELDON VALIDATION COMPLETE")
+    table_seldon = pd.DataFrame(list_seldon)
+    table_seldon.columns=["Model","Throttle_Label","Model_name","Model_state", "Result", "Endpoint"]
+    table_seldon = table_seldon.loc[:,["Model", "Model_state", "Throttle_Label","Model_name", "Endpoint", "Result"]]
+    table_seldon.to_csv(here+"//Validations//Validation_seldon-"+timestr+".csv")
+
+    model_down=table_seldon[table_seldon['Model_state']=='ERROR']
+    if(len(model_down)!=0):
+        model_down.to_csv(here+"//Validations//Model_down-"+timestr+".csv")
+
+def jarvis_iconic_validation(count,url):
+    print("Inside Jarvis Validation:\ncount:",count,"\nurl:",url)
+    # JARVIS VALIDATION
+    table=[]
+    for idx,_input in enumerate(data):
+        payload=_input["data"]
+        category = payload['serviceRequest']['rtModel']['rtModelReq'][0]['features']['ClientFeature']['contextInfo']['category']
+        if category=="Smartphones":
+            for _count in range(count):
+                payload['serviceHeader']['ecId'] = ''.join(random.choices(string.ascii_uppercase + string.digits, k = 10)) 
+                response = requesting(url=url,load=payload,headers={'content-type': 'application/json'})
+                validation = validate(idx,response,category)
+                table.append(validation)
+
+    print("JARVIS VALIDATION COMPLETE")
+    timestr = time.strftime("%m-%d-%Y-%H%M%S")
+    table = pd.DataFrame(table)
+    table.columns=["usecase","channelName","category","Throttle_Label","jarvisTransactionID","Model_name","Model_state"]        
+    table['Endpoint']=url
+    table = table.loc[:,["usecase","Model_state","channelName","category","Throttle_Label","Model_name","jarvisTransactionID","Endpoint"]]
+    table.to_csv(here+"//Validations//Validation-"+timestr+".csv")
+
+    empty_throttle=table[table['Model_state']=="ERROR"]
+    if(len(empty_throttle)!=0):
+        print("ERROR IN JARVIS VALIDATION...")
+        empty_throttle.to_csv(here+"//Validations//Empty_throttle-"+timestr+".csv")
+        seldon_validation(3,url)
+
+
+url_sit = "https://jarvissit.ebiz.verizon.com/jarvis/api/getModelInsights"
+url_uat = "https://jarvisuat.ebiz.verizon.com/jarvis/api/getModelInsights"
+url_prod_east = "https://jarvisprdeast.verizon.com/jarvis/api/getModelInsights"
+url_prod_west = "https://jarvisprdwest.verizon.com/jarvis/api/getModelInsights"
+
+# Change the values 
+jarvis_validation(count=5,url=url_uat)
+
+#jarvis_iconic_validation(count=5,url=url_prod_east)
+#seldon_validation(count=10,url_seldon=url_prod_east)
